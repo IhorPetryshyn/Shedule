@@ -12,13 +12,15 @@ import streamlit as st
 # ==========================================
 # 1. ГЛОБАЛЬНІ НАЛАШТУВАННЯ ТА БАЗА ДАНИХ
 # ==========================================
-st.set_page_config(page_title="Генератор шкільного розкладу", layout="wide")
+st.set_page_config(page_title="Генератор розкладу (Санітарні норми)", layout="wide")
 
 DAYS = ['Понеділок', 'Вівторок', 'Середа', 'Четвер', "П'ятниця"]
 SLOTS = [1, 2, 3, 4, 5, 6, 7, 8]
 
 LESSONS_FILE = "saved_lessons.csv"
 RULES_FILE = "saved_rules.csv"
+
+HARD_SUBJECTS = ["математика", "алгебра", "геометрія", "фізика", "хімія", "українська", "іноземна", "англійська", "інформатика"]
 
 def load_data():
     if os.path.exists(LESSONS_FILE):
@@ -42,7 +44,6 @@ if 'lessons_db' not in st.session_state or 'rules_db' not in st.session_state:
 # 2. РОБОТА З EXCEL (ІМПОРТ ТА ШАБЛОН)
 # ==========================================
 def create_excel_template():
-    """Створює готову матрицю шаблону input_data.xlsx у пам'яті"""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_lessons_sample = pd.DataFrame([
@@ -67,9 +68,7 @@ def create_excel_template():
     output.seek(0)
     return output
 
-
 def process_uploaded_excel(uploaded_file):
-    """Парсить завантажений Excel-файл і конвертує його у внутрішній формат бази"""
     try:
         xls = pd.ExcelFile(uploaded_file)
         
@@ -110,14 +109,14 @@ def process_uploaded_excel(uploaded_file):
             st.session_state['rules_db'] = pd.DataFrame(new_rules)
 
         save_data()
-        st.success("✅ Дані з Excel успішно імпортовано та збережено!")
+        st.success("✅ Дані з Excel успішно імпортовано!")
         st.rerun()
 
     except Exception as e:
         st.error(f"❌ Помилка читання Excel-файлу: {e}")
 
 # ==========================================
-# 3. РОЗШИРЕНЕ МАТЕМАТИЧНЕ ЯДРО (PuLP)
+# 3. МАТЕМАТИЧНЕ ЯДРО ОПТИМІЗАЦІЇ (PuLP)
 # ==========================================
 def solve_schedule(df_lessons, df_rules, opts):
     lessons = []
@@ -137,8 +136,9 @@ def solve_schedule(df_lessons, df_rules, opts):
     classes_list = sorted(df_lessons["Клас"].dropna().astype(str).unique().tolist())
     teachers_list = sorted(df_lessons["Вчитель"].dropna().astype(str).unique().tolist())
 
-    prob = pulp.LpProblem("School_Schedule_Optimization_Advanced", pulp.LpMinimize)
+    prob = pulp.LpProblem("School_Sanitary_Schedule_Optimization", pulp.LpMinimize)
     schedule_vars = {}
+    penalty_terms = []
 
     for c_id, subj, t, l_id, wt in lessons:
         for d in DAYS:
@@ -146,12 +146,10 @@ def solve_schedule(df_lessons, df_rules, opts):
                 var_name = f"g_{c_id}_{l_id}_{d}_{s}".replace(" ", "_").replace("'", "_")
                 schedule_vars[(c_id, subj, t, l_id, wt, d, s)] = pulp.LpVariable(var_name, cat='Binary')
 
-    # БАЗОВІ ОБМЕЖЕННЯ
-    # 1. Кожен урок має відбутися 1 раз на тиждень
+    # ОБОВ'ЯЗКОВІ БАЗОВІ ОБМЕЖЕННЯ
     for c_id, subj, t, l_id, wt in lessons:
         prob += pulp.lpSum(schedule_vars[(c_id, subj, t, l_id, wt, d, s)] for d in DAYS for s in SLOTS) == 1
 
-    # 2. Не більше одного уроку для класу одночасно
     for c_id in classes_list:
         for d in DAYS:
             for s in SLOTS:
@@ -160,7 +158,6 @@ def solve_schedule(df_lessons, df_rules, opts):
                 w2 = [schedule_vars[(c, subj, t, l_id, wt, d, s)] for c, subj, t, l_id, wt in lessons if c == c_id and wt in ["Кожен тиждень", "Знаменник (Тиждень 2)"]]
                 prob += pulp.lpSum(w2) <= 1
 
-    # 3. Вчитель не може бути в двох класах одночасно
     for t_name in teachers_list:
         for d in DAYS:
             for s in SLOTS:
@@ -169,7 +166,7 @@ def solve_schedule(df_lessons, df_rules, opts):
                 w2_t = [schedule_vars[(c, subj, t, l_id, wt, d, s)] for c, subj, t, l_id, wt in lessons if t == t_name and wt in ["Кожен тиждень", "Знаменник (Тиждень 2)"]]
                 prob += pulp.lpSum(w2_t) <= 1
 
-    # 4. Заборони з системи правил
+    # ОБРОБКА ВСІХ ТИПІВ ЗАБОРОН (Вчитель, Клас, Вся школа)
     for _, row in df_rules.dropna(subset=["Тип заборони", "День тижня", "Номер уроку"]).iterrows():
         r_type = str(row["Тип заборони"]).strip()
         r_obj = str(row["Об'єкт (Назва)"]).strip()
@@ -191,120 +188,110 @@ def solve_schedule(df_lessons, df_rules, opts):
             if vars_to_ban:
                 prob += pulp.lpSum(vars_to_ban) == 0
 
-    # 5. Без "вікон" у класах
+    # Без вікон для класів
     for c_id in classes_list:
         for d in DAYS:
             for i in range(1, len(SLOTS)):
                 s_curr, s_prev = SLOTS[i], SLOTS[i-1]
-                w1_curr = pulp.lpSum([schedule_vars[(c, subj, t, l_id, wt, d, s_curr)] for c, subj, t, l_id, wt in lessons if c == c_id and (wt == "Кожен тиждень" or wt == "Чисельник (Тиждень 1)")])
-                w1_prev = pulp.lpSum([schedule_vars[(c, subj, t, l_id, wt, d, s_prev)] for c, subj, t, l_id, wt in lessons if c == c_id and (wt == "Кожен тиждень" or wt == "Чисельник (Тиждень 1)")])
+                w1_curr = pulp.lpSum([schedule_vars[(c, subj, t, l_id, wt, d, s_curr)] for c, subj, t, l_id, wt in lessons if c == c_id and wt in ["Кожен тиждень", "Чисельник (Тиждень 1)"]])
+                w1_prev = pulp.lpSum([schedule_vars[(c, subj, t, l_id, wt, d, s_prev)] for c, subj, t, l_id, wt in lessons if c == c_id and wt in ["Кожен тиждень", "Чисельник (Тиждень 1)"]])
                 prob += w1_curr <= w1_prev
-                
-                w2_curr = pulp.lpSum([schedule_vars[(c, subj, t, l_id, wt, d, s_curr)] for c, subj, t, l_id, wt in lessons if c == c_id and (wt == "Кожен тиждень" or wt == "Знаменник (Тиждень 2)")])
-                w2_prev = pulp.lpSum([schedule_vars[(c, subj, t, l_id, wt, d, s_prev)] for c, subj, t, l_id, wt in lessons if c == c_id and (wt == "Кожен тиждень" or wt == "Знаменник (Тиждень 2)")])
-                prob += w2_curr <= w2_prev
-
-    # 6. Спортзал (макс 1 фізкультура одночасно)
-    for d in DAYS:
-        for s in SLOTS:
-            pe_vars = [schedule_vars[(c, subj, t, l_id, wt, d, s)] for c, subj, t, l_id, wt in lessons if subj.strip().lower() == "фізкультура"]
-            if pe_vars: prob += pulp.lpSum(pe_vars) <= 1
 
     # ==========================================
-    # НОВІ ДОДАТКОВІ ОБМЕЖЕННЯ (САНІТАРНІ ТА ВЧИТЕЛЬСЬКІ)
+    # НАЛАШТОВУВАНІ САНІТАРНІ ОБМЕЖЕННЯ (ОПЦІЇ)
     # ==========================================
-
-    # А. МАКСИМАЛЬНА КІЛЬКІСТЬ УРОКІВ НА ДЕНЬ ДЛЯ КЛАСУ
-    if opts.get("max_daily_lessons"):
-        max_daily = opts["max_daily_lessons"]
-        for c_id in classes_list:
-            for d in DAYS:
-                prob += pulp.lpSum(schedule_vars[(c, subj, t, l_id, wt, d, s)]
-                                   for c, subj, t, l_id, wt in lessons if c == c_id for s in SLOTS) <= max_daily
-
-    # Б. ЗАБОРОНА СКЛАДНИХ ПРЕДМЕТІВ НА ОСТАННІХ УРОКАХ (7-8 уроки)
-    if opts.get("ban_hard_on_late_slots"):
-        hard_keywords = ["математика", "алгебра", "геометрія", "фізика", "хімія", "іноземна", "англійська", "інформатика"]
+    
+    # Опція 1: Динаміка працездатності (Вівторок/Середа 2-3 уроки для складних предметів)
+    if opts.get("sanitary_peak_workload"):
         for c, subj, t, l_id, wt in lessons:
-            if any(kw in subj.lower() for kw in hard_keywords):
+            if any(kw in subj.lower() for kw in HARD_SUBJECTS):
                 for d in DAYS:
-                    for s in [7, 8]:
-                        prob += schedule_vars[(c, subj, t, l_id, wt, d, s)] == 0
-
-    # В. НЕ БІЛЬШЕ 1 УРОКУ ОДНОГО ПРЕДМЕТА НА ДЕНЬ (якщо годин <= 5)
-    if opts.get("max_one_subj_per_day"):
-        for c_id in classes_list:
-            class_subjs = set(subj for c, subj, t, l_id, wt in lessons if c == c_id)
-            for subj_name in class_subjs:
-                matching = [l for l in lessons if l[0] == c_id and l[1] == subj_name]
-                if len(matching) <= 5:
-                    for d in DAYS:
-                        prob += pulp.lpSum(schedule_vars[(c, subj, t, l_id, wt, d, s)]
-                                           for c, subj, t, l_id, wt in matching for s in SLOTS) <= 1
-
-    # Г. ДОПОМІЖНІ ЗМІННІ ДЛЯ ВЧИТЕЛІВ
-    teacher_active = {}
-    for t_name in teachers_list:
-        for d in DAYS:
-            for s in SLOTS:
-                var_t = pulp.LpVariable(f"t_act_{t_name}_{d}_{s}".replace(" ", "_").replace("'", "_"), cat='Binary')
-                teacher_active[(t_name, d, s)] = var_t
-                t_lessons = [schedule_vars[(c, subj, t, l_id, wt, d, s)] for c, subj, t, l_id, wt in lessons if t == t_name]
-                if t_lessons:
-                    prob += var_t == pulp.lpSum(t_lessons)
-                else:
-                    prob += var_t == 0
-
-    # Д. МАКСИМУМ УРОКІВ ПОСПІЛЬ ДЛЯ ВЧИТЕЛЯ БЕЗ ПЕРЕРВИ
-    if opts.get("max_consecutive_teacher"):
-        max_c = opts["max_consecutive_teacher"]
-        for t_name in teachers_list:
-            for d in DAYS:
-                for s in range(1, 9 - max_c):
-                    prob += pulp.lpSum(teacher_active[(t_name, d, k)] for k in range(s, s + max_c + 1)) <= max_c
-
-    # Е. МЕТОДИЧНИЙ ДЕНЬ ВЧИТЕЛЯ (1 повністю вільний день при навантаженні <= 20 год)
-    if opts.get("teacher_method_day"):
-        for t_name in teachers_list:
-            t_total_hours = sum(1 for c, subj, t, l_id, wt in lessons if t == t_name)
-            if t_total_hours <= 20:
-                t_day_active = {}
-                for d in DAYS:
-                    d_var = pulp.LpVariable(f"t_day_act_{t_name}_{d}".replace(" ", "_").replace("'", "_"), cat='Binary')
-                    t_day_active[d] = d_var
                     for s in SLOTS:
-                        prob += teacher_active[(t_name, d, s)] <= d_var
-                prob += pulp.lpSum(t_day_active[d] for d in DAYS) <= 4
+                        penalty = 0
+                        if d in ["Понеділок", "П'ятниця"]: penalty += 3
+                        if s in [1, 7, 8]: penalty += 4
+                        elif s in [2, 3, 4] and d in ["Вівторок", "Середа"]: penalty -= 2
+                        
+                        if penalty > 0:
+                            p_var = pulp.LpVariable(f"p_hard_{l_id}_{d}_{s}", cat='Continuous')
+                            prob += p_var >= penalty * schedule_vars[(c, subj, t, l_id, wt, d, s)]
+                            penalty_terms.append(p_var)
 
-    # Ж. РОЗПОДІЛ ПРЕДМЕТІВ З 2 ГОД/ТИЖДЕНЬ (не ставити в суміжні дні поспіль)
-    if opts.get("spread_two_hour_subjs"):
+    # Опція 2: Чергування предметів (Заборона 2 поспіль складних дисциплін)
+    if opts.get("alternate_disciplines"):
         for c_id in classes_list:
-            class_subjs = set(subj for c, subj, t, l_id, wt in lessons if c == c_id)
-            for subj_name in class_subjs:
-                matching = [l for l in lessons if l[0] == c_id and l[1] == subj_name]
-                if len(matching) == 2:
-                    c_day_var = {}
+            for d in DAYS:
+                for s in range(1, len(SLOTS)):
+                    s1, s2 = SLOTS[s-1], SLOTS[s]
+                    h1 = [schedule_vars[(c, subj, t, l_id, wt, d, s1)] for c, subj, t, l_id, wt in lessons if c == c_id and any(kw in subj.lower() for kw in HARD_SUBJECTS)]
+                    h2 = [schedule_vars[(c, subj, t, l_id, wt, d, s2)] for c, subj, t, l_id, wt in lessons if c == c_id and any(kw in subj.lower() for kw in HARD_SUBJECTS)]
+                    if h1 and h2:
+                        prob += pulp.lpSum(h1) + pulp.lpSum(h2) <= 1
+
+    # Опція 3: Контроль здвоєних уроків (Тільки 10-11 кл або лаб./практ./технології)
+    if opts.get("enforce_double_lesson_rules"):
+        for c_id in classes_list:
+            is_senior = any(grade in c_id for grade in ["10", "11", "12"])
+            for d in DAYS:
+                for s in range(1, len(SLOTS)):
+                    s1, s2 = SLOTS[s-1], SLOTS[s]
+                    class_subjs = set(subj for c, subj, t, l_id, wt in lessons if c == c_id)
+                    for subj_name in class_subjs:
+                        is_allowed_double = is_senior or any(kw in subj_name.lower() for kw in ["лабораторна", "практична", "трудове", "технології"])
+                        if not is_allowed_double:
+                            v1 = [schedule_vars[(c, subj, t, l_id, wt, d, s1)] for c, subj, t, l_id, wt in lessons if c == c_id and subj == subj_name]
+                            v2 = [schedule_vars[(c, subj, t, l_id, wt, d, s2)] for c, subj, t, l_id, wt in lessons if c == c_id and subj == subj_name]
+                            if v1 and v2: prob += pulp.lpSum(v1) + pulp.lpSum(v2) <= 1
+
+    # Опція 4: Обмеження Фізкультури (Не 1-м та не 7-8 уроками)
+    if opts.get("pe_slot_restrictions"):
+        for c, subj, t, l_id, wt in lessons:
+            if "фізкультура" in subj.lower():
+                for d in DAYS:
+                    prob += schedule_vars[(c, subj, t, l_id, wt, d, 1)] == 0
+                    prob += schedule_vars[(c, subj, t, l_id, wt, d, 7)] == 0
+                    prob += schedule_vars[(c, subj, t, l_id, wt, d, 8)] == 0
+
+    # Опція 5: Максимальна кількість уроків на день (Загальний ліміт)
+    if opts.get("enable_max_daily_lessons"):
+        max_daily = opts.get("max_daily_lessons", 7)
+        for c_id in classes_list:
+            for d in DAYS:
+                prob += pulp.lpSum(schedule_vars[(c, subj, t, l_id, wt, d, s)] for c, subj, t, l_id, wt in lessons if c == c_id for s in SLOTS) <= max_daily
+
+    # Опція 6: Обмеження для початкової школи (1-4 класи)
+    if opts.get("enable_screen_time_limits"):
+        for c_id in classes_list:
+            digits = "".join([ch for ch in c_id if ch.isdigit()])
+            if digits:
+                g_num = int(digits)
+                limit = 7
+                if g_num == 1: limit = 4
+                elif 2 <= g_num <= 4: limit = 5
+                
+                if limit < 7:
                     for d in DAYS:
-                        cd_var = pulp.LpVariable(f"cd_act_{c_id}_{subj_name}_{d}".replace(" ", "_").replace("'", "_"), cat='Binary')
-                        c_day_var[d] = cd_var
-                        prob += pulp.lpSum(schedule_vars[(c, subj, t, l_id, wt, d, s)]
-                                           for c, subj, t, l_id, wt in matching for s in SLOTS) <= cd_var
-                    for i in range(len(DAYS) - 1):
-                        d_curr, d_next = DAYS[i], DAYS[i+1]
-                        prob += c_day_var[d_curr] + c_day_var[d_next] <= 1
+                        prob += pulp.lpSum(schedule_vars[(c, subj, t, l_id, wt, d, s)] for c, subj, t, l_id, wt in lessons if c == c_id for s in SLOTS) <= limit
+
+    if penalty_terms:
+        prob += pulp.lpSum(penalty_terms)
 
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     return pulp.LpStatus[prob.status], schedule_vars, lessons, classes_list, teachers_list
 
 # ==========================================
-# 4. ГРАФІЧНИЙ ІНТЕРФЕЙС STREAMLIT
+# 4. ІНТЕРФЕЙС STREAMLIT
 # ==========================================
-st.title("🏫 Розумний шкільний розклад (Макс. 8 уроків)")
-st.write("Автоматична оптимізація із урахуванням санітарних норм, зручності вчителів та матричним коригуванням.")
+st.title("🏫 Генератор шкільного розкладу")
 
-tab1, tab2, tab3 = st.tabs(["📋 Навантаження школи", "🚫 Керування заборонами", "🚀 Генерація та коригування"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📋 Навантаження та Excel", 
+    "🚫 Заборони (Вчителі, Класи, Школа)", 
+    "⚙️ Налаштування та Генерація", 
+    "ℹ️ Санітарний регламент (Довідка)"
+])
 
-# --- ВКЛАДКА 1: НАВАНТАЖЕННЯ ---
+# --- ВКЛАДКА 1: НАВАНТАЖЕННЯ І EXCEL ---
 with tab1:
     with st.expander("📁 Імпорт даних з Excel та завантаження шаблону", expanded=False):
         col_ex1, col_ex2 = st.columns([1, 1])
@@ -331,10 +318,10 @@ with tab1:
     with st.form("quick_add_form", clear_on_submit=True):
         f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns(5)
         c_id = f_col1.text_input("Клас (напр: 10-A):")
-        subj = f_col2.text_input("Предмет (напр: Хімія):")
-        teacher = f_col3.text_input("Вчитель (напр: Васильєва):")
+        subj = f_col2.text_input("Предмет:")
+        teacher = f_col3.text_input("Вчитель:")
         hours = f_col4.number_input("Годин на тиждень:", min_value=1, max_value=10, value=1)
-        week_select = f_col5.selectbox("Періодичність:", ["Кожен тиждень", "Чисельник (Тиждень 1)", "Знаменник (Тиждень 2)"])
+        week_select = f_col5.selectbox("Тиждень:", ["Кожен тиждень", "Чисельник (Тиждень 1)", "Знаменник (Тиждень 2)"])
         
         if st.form_submit_button("➕ Додати у базу"):
             if c_id and subj and teacher:
@@ -344,284 +331,356 @@ with tab1:
                 st.rerun()
 
     st.subheader("2. Інтерактивна таблиця предметів")
-    edited_lessons = st.data_editor(
-        st.session_state['lessons_db'], 
-        use_container_width=True, 
-        num_rows="dynamic",
-        column_config={
-            "Тиждень": st.column_config.SelectboxColumn(options=["Кожен тиждень", "Чисельник (Тиждень 1)", "Знаменник (Тиждень 2)"])
-        }
-    )
+    edited_lessons = st.data_editor(st.session_state['lessons_db'], use_container_width=True, num_rows="dynamic")
     if not edited_lessons.equals(st.session_state['lessons_db']):
         st.session_state['lessons_db'] = edited_lessons
         save_data()
-        st.toast("💾 Навантаження оновлено на диску!")
 
-# --- ВКЛАДКА 2: КЕРУВАННЯ ЗАБОРОНАМИ ---
+# --- ВКЛАДКА 2: ВСІ ТИПИ ЗАБОРОН ---
 with tab2:
-    st.subheader("1. Створити нове обмеження часу")
-    active_classes = sorted(st.session_state['lessons_db']["Клас"].dropna().astype(str).unique().tolist())
-    active_teachers = sorted(st.session_state['lessons_db']["Вчитель"].dropna().astype(str).unique().tolist())
+    st.subheader("🚫 Керування заборонами розкладу")
     
-    if not active_classes and not active_teachers:
-        st.info("💡 Спочатку додайте предмети та вчителів на вкладці 'Навантаження школи', щоб налаштувати для них заборони.")
-    else:
-        with st.form("quick_rule_form", clear_on_submit=True):
-            r_col1, r_col2, r_col3, r_col4 = st.columns(4)
-            r_type = r_col1.selectbox("Кому забороняємо?", ["Вчитель", "Клас", "Вся школа"])
+    ban_tab1, ban_tab2, ban_tab3, ban_tab4 = st.tabs([
+        "👨‍🏫 Заборони Вчителів (Сітка)", 
+        "🏫 Заборони Класів (Сітка)", 
+        "🏢 Загальношкільні заборони",
+        "📋 Повна таблиця правил"
+    ])
+
+    # 1. Заборони Вчителів (Графічна сітка)
+    with ban_tab1:
+        st.markdown("##### 📅 Вільні/зайняті уроки вчителів")
+        active_teachers = sorted(st.session_state['lessons_db']["Вчитель"].dropna().astype(str).unique().tolist())
+        if active_teachers:
+            selected_teacher = st.selectbox("Виберіть вчителя:", active_teachers, key="sel_t")
+            grid_data = {day: [False] * len(SLOTS) for day in DAYS}
             
-            if r_type == "Вчитель":
-                r_obj = r_col2.selectbox("Виберіть вчителя:", active_teachers if active_teachers else ["Немає вчителів"])
-            elif r_type == "Клас":
-                r_obj = r_col2.selectbox("Виберіть клас:", active_classes if active_classes else ["Немає класів"])
-            else:
-                r_obj = r_col2.selectbox("Об'єкт:", ["Усі"])
-                
-            r_day = r_col3.selectbox("День тижня:", DAYS)
-            r_slot = r_col4.selectbox("Який урок заблокувати?", ["Весь день", "1", "2", "3", "4", "5", "6", "7", "8"])
+            t_rules = st.session_state['rules_db'][
+                (st.session_state['rules_db']["Тип заборони"] == "Вчитель") & 
+                (st.session_state['rules_db']["Об'єкт (Назва)"] == selected_teacher)
+            ]
+            for _, r in t_rules.iterrows():
+                d, s_val = r["День тижня"], str(r["Номер уроку"]).strip()
+                if d in grid_data:
+                    if s_val.lower() == "весь день": grid_data[d] = [True] * len(SLOTS)
+                    elif s_val.isdigit() and 0 <= int(s_val) - 1 < len(SLOTS): grid_data[d][int(s_val) - 1] = True
+
+            df_t_grid = pd.DataFrame(grid_data, index=[f"Урок №{s}" for s in SLOTS])
+            st.caption("☑️ Позначено галочкою = Вчитель НЕ МОЖЕ проводити урок у цей час")
+            edited_t_grid = st.data_editor(df_t_grid, use_container_width=True, key=f"grid_t_{selected_teacher}")
+
+            if st.button(f"💾 Зберегти графік для {selected_teacher}", type="primary"):
+                st.session_state['rules_db'] = st.session_state['rules_db'][
+                    ~((st.session_state['rules_db']["Тип заборони"] == "Вчитель") & 
+                      (st.session_state['rules_db']["Об'єкт (Назва)"] == selected_teacher))
+                ]
+                new_r = []
+                for d in DAYS:
+                    if all(edited_t_grid.loc[f"Урок №{s}", d] for s in SLOTS):
+                        new_r.append({"Тип заборони": "Вчитель", "Об'єкт (Назва)": selected_teacher, "День тижня": d, "Номер уроку": "Весь день"})
+                    else:
+                        for s in SLOTS:
+                            if edited_t_grid.loc[f"Урок №{s}", d]:
+                                new_r.append({"Тип заборони": "Вчитель", "Об'єкт (Назва)": selected_teacher, "День тижня": d, "Номер уроку": str(s)})
+                if new_r:
+                    st.session_state['rules_db'] = pd.concat([st.session_state['rules_db'], pd.DataFrame(new_r)], ignore_index=True)
+                save_data()
+                st.toast("✅ Графік вчителя збережено!")
+        else:
+            st.info("Спочатку додайте вчителів у вкладці 'Навантаження'.")
+
+    # 2. Заборони Класів (Графічна сітка)
+    with ban_tab2:
+        st.markdown("##### 📅 Дні та уроки, коли клас НЕ ВЧИТЬСЯ")
+        active_classes = sorted(st.session_state['lessons_db']["Клас"].dropna().astype(str).unique().tolist())
+        if active_classes:
+            selected_class = st.selectbox("Виберіть клас:", active_classes, key="sel_c")
+            grid_c_data = {day: [False] * len(SLOTS) for day in DAYS}
             
-            if st.form_submit_button("➕ Зафіксувати заборону"):
-                new_rule = pd.DataFrame([{"Тип заборони": r_type, "Об'єкт (Назва)": r_obj, "День тижня": r_day, "Номер уроку": r_slot}])
-                st.session_state['rules_db'] = pd.concat([st.session_state['rules_db'], new_rule], ignore_index=True)
+            c_rules = st.session_state['rules_db'][
+                (st.session_state['rules_db']["Тип заборони"] == "Клас") & 
+                (st.session_state['rules_db']["Об'єкт (Назва)"] == selected_class)
+            ]
+            for _, r in c_rules.iterrows():
+                d, s_val = r["День тижня"], str(r["Номер уроку"]).strip()
+                if d in grid_c_data:
+                    if s_val.lower() == "весь день": grid_c_data[d] = [True] * len(SLOTS)
+                    elif s_val.isdigit() and 0 <= int(s_val) - 1 < len(SLOTS): grid_c_data[d][int(s_val) - 1] = True
+
+            df_c_grid = pd.DataFrame(grid_c_data, index=[f"Урок №{s}" for s in SLOTS])
+            st.caption("☑️ Позначено галочкою = У класу НЕ ПЛАНУЄТЬСЯ урок у цей час")
+            edited_c_grid = st.data_editor(df_c_grid, use_container_width=True, key=f"grid_c_{selected_class}")
+
+            if st.button(f"💾 Зберегти графік для {selected_class}", type="primary"):
+                st.session_state['rules_db'] = st.session_state['rules_db'][
+                    ~((st.session_state['rules_db']["Тип заборони"] == "Клас") & 
+                      (st.session_state['rules_db']["Об'єкт (Назва)"] == selected_class))
+                ]
+                new_r = []
+                for d in DAYS:
+                    if all(edited_c_grid.loc[f"Урок №{s}", d] for s in SLOTS):
+                        new_r.append({"Тип заборони": "Клас", "Об'єкт (Назва)": selected_class, "День тижня": d, "Номер уроку": "Весь день"})
+                    else:
+                        for s in SLOTS:
+                            if edited_c_grid.loc[f"Урок №{s}", d]:
+                                new_r.append({"Тип заборони": "Клас", "Об'єкт (Назва)": selected_class, "День тижня": d, "Номер уроку": str(s)})
+                if new_r:
+                    st.session_state['rules_db'] = pd.concat([st.session_state['rules_db'], pd.DataFrame(new_r)], ignore_index=True)
+                save_data()
+                st.toast("✅ Графік класу збережено!")
+        else:
+            st.info("Спочатку додайте класи у вкладці 'Навантаження'.")
+
+    # 3. Загальношкільні заборони
+    with ban_tab3:
+        st.markdown("##### 🏢 Заборона уроків для ВСІЄЇ школи (наприклад, 8-й урок у П'ятницю / Педрада)")
+        with st.form("school_ban_form", clear_on_submit=True):
+            sb_col1, sb_col2, sb_col3 = st.columns(3)
+            sb_day = sb_col1.selectbox("День тижня:", DAYS)
+            sb_slot = sb_col2.selectbox("Номер уроку:", ["Весь день", "1", "2", "3", "4", "5", "6", "7", "8"])
+            sb_desc = sb_col3.text_input("Об'єкт / Примітка:", value="Усі")
+            
+            if st.form_submit_button("➕ Додати загальношкільну заборону"):
+                new_s_rule = pd.DataFrame([{"Тип заборони": "Вся школа", "Об'єкт (Назва)": sb_desc, "День тижня": sb_day, "Номер уроку": sb_slot}])
+                st.session_state['rules_db'] = pd.concat([st.session_state['rules_db'], new_s_rule], ignore_index=True)
                 save_data()
                 st.rerun()
 
-    st.subheader("2. Інтерактивна таблиця всіх заборон")
-    edited_rules = st.data_editor(
-        st.session_state['rules_db'], 
-        use_container_width=True, 
-        num_rows="dynamic",
-        column_config={
-            "Тип заборони": st.column_config.SelectboxColumn(options=["Вчитель", "Клас", "Вся школа"]),
-            "День тижня": st.column_config.SelectboxColumn(options=DAYS),
-            "Номер уроку": st.column_config.SelectboxColumn(options=["Весь день", "1", "2", "3", "4", "5", "6", "7", "8"])
-        }
-    )
-    if not edited_rules.equals(st.session_state['rules_db']):
-        st.session_state['rules_db'] = edited_rules
-        save_data()
-        st.toast("💾 Заборони автоматично синхронізовано на диску!")
+    # 4. Повна редагована таблиця
+    with ban_tab4:
+        st.markdown("##### 📊 Загальний реєстр усіх правил та обмежень")
+        edited_rules = st.data_editor(
+            st.session_state['rules_db'], 
+            use_container_width=True, 
+            num_rows="dynamic",
+            column_config={
+                "Тип заборони": st.column_config.SelectboxColumn(options=["Вчитель", "Клас", "Вся школа"]),
+                "День тижня": st.column_config.SelectboxColumn(options=DAYS),
+                "Номер уроку": st.column_config.SelectboxColumn(options=["Весь день", "1", "2", "3", "4", "5", "6", "7", "8"])
+            }
+        )
+        if not edited_rules.equals(st.session_state['rules_db']):
+            st.session_state['rules_db'] = edited_rules
+            save_data()
 
-# --- ВКЛАДКА 3: РОЗРАХУНОК ТА РУЧНЕ КОРИГУВАННЯ ПО ДНЯХ ---
+# --- ВКЛАДКА 3: ГЕНЕРАЦІЯ ТА САНІТАРНІ ОПЦІЇ ---
 with tab3:
-    st.subheader("Генерація та ручне коригування розкладу")
-    df_lessons_clean = st.session_state['lessons_db'].dropna(subset=["Клас", "Предмет", "Вчитель"])
-    
-    if df_lessons_clean.empty:
-        st.info("Будь ласка, заповніть навантаження на першій вкладці.")
-    else:
-        with st.expander("⚙️ Додаткові санітарні та педагогічні правила", expanded=True):
-            st.markdown("**Налаштуйте розумні обмеження для покращення якісних показників розкладу:**")
-            opt_col1, opt_col2 = st.columns(2)
+    st.subheader("⚙️ Санітарні норми та генерація розкладу")
+    st.markdown("Виберіть **галочками**, які санітарно-гігієнічні правила повинен врахувати алгоритм:")
+
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        st.markdown("##### 🧠 Динаміка працездатності та дисципліни")
+        opt_peak = st.checkbox("1. Оптимізувати складні предмети на Вівторок/Середу (2–3 уроки)", value=True, help="Математика, мови, фізика та хімія ставляться у години найвищої працездатності")
+        opt_alt = st.checkbox("2. Заборонити 2 поспіль складних предмети (чергувати з легкими)", value=True, help="Не допускає послідовного проведення двох складних STEM/мовних уроків")
+        opt_double = st.checkbox("3. Обмежити здвоєні уроки (тільки 10–11 кл або лаб./технології)", value=True, help="Забороняє спарені уроки у 5–9 класах за винятком трудового/практик")
+
+    with col_s2:
+        st.markdown("##### 🏃 Рухова активність та навантаження")
+        opt_pe = st.checkbox("4. Не ставити Фізкультуру 1-м або 7–8 уроками", value=True, help="Розподіляє уроки фізкультури у середині навчального дня")
+        
+        opt_max_daily_enabled = st.checkbox("5. Обмежити максимальну кількість уроків на день", value=True)
+        if opt_max_daily_enabled:
+            opt_max_daily_val = st.number_input("Максимум уроків на день для старших класів:", min_value=4, max_value=8, value=7)
+        else:
+            opt_max_daily_val = 8
             
-            with opt_col1:
-                st.markdown("##### 🏫 Для учнів та класів")
-                max_daily = st.number_input("Максимум уроків на день для класу:", min_value=4, max_value=8, value=7)
-                ban_hard_late = st.checkbox("Заборонити складні предмети на 7-8 уроках (Математика, Фізика, Хімія)", value=True)
-                max_one_subj = st.checkbox("Не більше 1 уроку одного предмета на день (якщо <= 5 год/тиждень)", value=True)
-                spread_two_hour = st.checkbox("Розносити предмети з 2 год/тиждень (не в суміжні дні поспіль)", value=True)
+        opt_screen_limits = st.checkbox("6. Враховувати норми для початкової школи (1–4 класи)", value=True, help="Автоматично обмежує денну кількість занять для 1–4 класів")
 
-            with opt_col2:
-                st.markdown("##### 👨‍🏫 Для вчителів")
-                max_consec = st.number_input("Максимум уроків поспіль для вчителя без перерви:", min_value=2, max_value=6, value=4)
-                teacher_m_day = st.checkbox("Забезпечити 1 методичний (вільний) день при навантаженні <= 20 год", value=True)
+    opts_dict = {
+        "sanitary_peak_workload": opt_peak,
+        "alternate_disciplines": opt_alt,
+        "enforce_double_lesson_rules": opt_double,
+        "pe_slot_restrictions": opt_pe,
+        "enable_max_daily_lessons": opt_max_daily_enabled,
+        "max_daily_lessons": opt_max_daily_val,
+        "enable_screen_time_limits": opt_screen_limits
+    }
 
-        opts_dict = {
-            "max_daily_lessons": max_daily,
-            "ban_hard_on_late_slots": ban_hard_late,
-            "max_one_subj_per_day": max_one_subj,
-            "max_consecutive_teacher": max_consec,
-            "teacher_method_day": teacher_m_day,
-            "spread_two_hour_subjs": spread_two_hour
-        }
+    st.markdown("---")
+    col_gen1, col_gen2 = st.columns([2, 1])
+    with col_gen1:
+        run_calc = st.button("🚀 ЗАПУСТИТИ АВТОМАТИЧНИЙ РОЗРАХУНОК", type="primary", use_container_width=True)
+    with col_gen2:
+        if 'generated_schedule' in st.session_state and not st.session_state['generated_schedule'].empty:
+            if st.button("🔄 Скинути розклади", use_container_width=True):
+                del st.session_state['generated_schedule']
+                st.rerun()
 
-        col_gen1, col_gen2 = st.columns([2, 1])
-        with col_gen1:
-            run_calc = st.button("🚀 ЗАПУСТИТИ АВТОМАТИЧНИЙ РОЗРАХУНОК", type="primary", use_container_width=True)
-        with col_gen2:
-            if 'generated_schedule' in st.session_state and not st.session_state['generated_schedule'].empty:
-                if st.button("🔄 Скинути ручні правки", use_container_width=True):
-                    del st.session_state['generated_schedule']
+    if run_calc:
+        df_lessons_clean = st.session_state['lessons_db'].dropna(subset=["Клас", "Предмет", "Вчитель"])
+        with st.spinner("Оптимізація розкладу за обраними правилами..."):
+            status, schedule_vars, lessons_data, classes_list, teachers_list = solve_schedule(df_lessons_clean, st.session_state['rules_db'], opts_dict)
+            
+            if status == "Optimal":
+                st.balloons()
+                st.success("🎉 Сформовано розклад відповідно до обраних налаштувань!")
+                
+                weekly_rows = []
+                for day in DAYS:
+                    for slot in SLOTS:
+                        for class_id in classes_list:
+                            w1_item, w2_item = "—", "—"
+                            for c, subj, t, l_id, wt in lessons_data:
+                                if str(c) == str(class_id) and schedule_vars[(c, subj, t, l_id, wt, day, slot)].varValue is not None:
+                                    if schedule_vars[(c, subj, t, l_id, wt, day, slot)].varValue > 0.9:
+                                        if wt == "Кожен тиждень":
+                                            w1_item = f"{subj} ({t})"
+                                            w2_item = f"{subj} ({t})"
+                                        elif wt == "Чисельник (Тиждень 1)":
+                                            w1_item = f"🔼 {subj} ({t})"
+                                        elif wt == "Знаменник (Тиждень 2)":
+                                            w2_item = f"🔽 {subj} ({t})"
+                            display_text = w1_item if w1_item == w2_item else f"{w1_item} / {w2_item}"
+                            weekly_rows.append({"Клас": class_id, "День тижня": day, "Номер уроку": slot, "Розклад (Чисельник / Знаменник)": display_text})
+                
+                st.session_state['generated_schedule'] = pd.DataFrame(weekly_rows)
+            else:
+                st.error("❌ Не вдалося побудувати розклад. Спробуйте вимкнути деякі санітарні опції або зменшити кількість заборон у вкладці 'Заборони'.")
+
+    # Відображення, Swap та Експорт
+    if 'generated_schedule' in st.session_state and not st.session_state['generated_schedule'].empty:
+        df_sched = st.session_state['generated_schedule']
+        
+        st.markdown("---")
+        st.subheader("✏️ Інструмент швидкого переміщення (Swap)")
+        
+        with st.expander("🔄 Обміняти два уроки місцями для класу", expanded=False):
+            swap_col1, swap_col2, swap_col3 = st.columns(3)
+            sel_class = swap_col1.selectbox("Виберіть клас:", sorted(df_sched["Клас"].unique()))
+            
+            with swap_col2:
+                day1 = st.selectbox("День 1:", DAYS, key="d1")
+                slot1 = st.selectbox("Урок 1:", SLOTS, key="s1")
+            
+            with swap_col3:
+                day2 = st.selectbox("День 2:", DAYS, key="d2")
+                slot2 = st.selectbox("Урок 2:", SLOTS, key="s2")
+            
+            if st.button("🔄 Обміняти уроки", use_container_width=True):
+                idx1 = df_sched[(df_sched["Клас"] == sel_class) & (df_sched["День тижня"] == day1) & (df_sched["Номер уроку"] == slot1)].index
+                idx2 = df_sched[(df_sched["Клас"] == sel_class) & (df_sched["День тижня"] == day2) & (df_sched["Номер уроку"] == slot2)].index
+                
+                if not idx1.empty and not idx2.empty:
+                    val1 = df_sched.loc[idx1[0], "Розклад (Чисельник / Знаменник)"]
+                    val2 = df_sched.loc[idx2[0], "Розклад (Чисельник / Знаменник)"]
+                    
+                    df_sched.loc[idx1[0], "Розклад (Чисельник / Знаменник)"] = val2
+                    df_sched.loc[idx2[0], "Розклад (Чисельник / Знаменник)"] = val1
+                    
+                    st.session_state['generated_schedule'] = df_sched
+                    st.toast("✅ Уроки успішно поміняно місцями!")
                     st.rerun()
 
-        if run_calc:
-            with st.spinner("Математична модель оптимізує розклад за усім комплексом правил..."):
-                status, schedule_vars, lessons_data, classes_list, teachers_list = solve_schedule(df_lessons_clean, st.session_state['rules_db'], opts_dict)
+        # ДЕТЕКТОР КОНФЛІКТІВ ВЧИТЕЛІВ
+        teacher_conflicts = []
+        temp_records = []
+        for _, row in df_sched.iterrows():
+            val = row["Розклад (Чисельник / Знаменник)"]
+            if val != "—":
+                parts = val.split(" / ")
+                for p in parts:
+                    if "(" in p and ")" in p:
+                        t_name = p.split("(")[1].split(")")[0].strip()
+                        temp_records.append({"Вчитель": t_name, "День": row["День тижня"], "Слот": row["Номер уроку"], "Клас": row["Клас"]})
+        
+        if temp_records:
+            check_df = pd.DataFrame(temp_records)
+            duplicates = check_df[check_df.duplicated(subset=["Вчитель", "День", "Слот"], keep=False)]
+            if not duplicates.empty:
+                for (t_name, d, s), group in duplicates.groupby(["Вчитель", "День", "Слот"]):
+                    classes_str = ", ".join(group["Клас"].unique())
+                    teacher_conflicts.append(f"⚠️ **{t_name}** має накладку в **{d}**, **{s}-й урок** у класах: {classes_str}")
+
+        if teacher_conflicts:
+            st.warning("Виявлено конфлікти після ручних правок:")
+            for conf in teacher_conflicts: st.write(conf)
+
+        st.subheader("📅 Розклад за днями тижня (Вся школа):")
+        day_tabs = st.tabs([f"🗓️ {day}" for day in DAYS])
+        
+        for idx, day_name in enumerate(DAYS):
+            with day_tabs[idx]:
+                df_day = df_sched[df_sched["День тижня"] == day_name]
+                pivot_day = df_day.pivot(index="Номер уроку", columns="Клас", values="Розклад (Чисельник / Знаменник)")
                 
-                if status == "Optimal":
-                    st.balloons()
-                    st.success("🎉 Новий розклад успішно побудовано із урахуванням усіх санітарних норм!")
-                    
-                    weekly_rows = []
-                    for day in DAYS:
-                        for slot in SLOTS:
-                            for class_id in classes_list:
-                                w1_item, w2_item = "—", "—"
-                                for c, subj, t, l_id, wt in lessons_data:
-                                    if str(c) == str(class_id) and schedule_vars[(c, subj, t, l_id, wt, day, slot)].varValue is not None:
-                                        if schedule_vars[(c, subj, t, l_id, wt, day, slot)].varValue > 0.9:
-                                            if wt == "Кожен тиждень":
-                                                w1_item = f"{subj} ({t})"
-                                                w2_item = f"{subj} ({t})"
-                                            elif wt == "Чисельник (Тиждень 1)":
-                                                w1_item = f"🔼 {subj} ({t})"
-                                            elif wt == "Знаменник (Тиждень 2)":
-                                                w2_item = f"🔽 {subj} ({t})"
-                                display_text = w1_item if w1_item == w2_item else f"{w1_item} / {w2_item}"
-                                weekly_rows.append({
-                                    "Клас": class_id, 
-                                    "День тижня": day, 
-                                    "Номер уроку": slot, 
-                                    "Розклад (Чисельник / Знаменник)": display_text
-                                })
-                    
-                    st.session_state['generated_schedule'] = pd.DataFrame(weekly_rows)
-                else:
-                    st.error(f"❌ Алгоритм зайшов у тупик (Статус: {status}). Спробуйте послабити деякі прапорці в налаштуваннях вище.")
-
-        # ЯКЩО РОЗКЛАД ЗГЕНЕРОВАНО — ВІДОБРАЖАЄМО ТА ДОЗВОЛЯЄМО РЕДАГУВАТИ ПО ДНЯХ
-        if 'generated_schedule' in st.session_state and not st.session_state['generated_schedule'].empty:
-            df_sched = st.session_state['generated_schedule']
-            
-            st.markdown("---")
-            st.subheader("✏️ Інструмент швидкого переміщення (Swap)")
-            
-            with st.expander("🔄 Обміняти два уроки місцями для класу", expanded=False):
-                swap_col1, swap_col2, swap_col3 = st.columns(3)
-                sel_class = swap_col1.selectbox("Виберіть клас:", sorted(df_sched["Клас"].unique()))
+                edited_pivot = st.data_editor(pivot_day, use_container_width=True, key=f"editor_day_{day_name}")
                 
-                with swap_col2:
-                    st.caption("Урок №1 (Звідки):")
-                    day1 = st.selectbox("День 1:", DAYS, key="d1")
-                    slot1 = st.selectbox("Урок 1:", SLOTS, key="s1")
-                
-                with swap_col3:
-                    st.caption("Урок №2 (Куди):")
-                    day2 = st.selectbox("День 2:", DAYS, key="d2")
-                    slot2 = st.selectbox("Урок 2:", SLOTS, key="s2")
-                
-                if st.button("🔄 Обміняти уроки", use_container_width=True):
-                    idx1 = df_sched[(df_sched["Клас"] == sel_class) & (df_sched["День тижня"] == day1) & (df_sched["Номер уроку"] == slot1)].index
-                    idx2 = df_sched[(df_sched["Клас"] == sel_class) & (df_sched["День тижня"] == day2) & (df_sched["Номер уроку"] == slot2)].index
-                    
-                    if not idx1.empty and not idx2.empty:
-                        val1 = df_sched.loc[idx1[0], "Розклад (Чисельник / Знаменник)"]
-                        val2 = df_sched.loc[idx2[0], "Розклад (Чисельник / Знаменник)"]
-                        
-                        df_sched.loc[idx1[0], "Розклад (Чисельник / Знаменник)"] = val2
-                        df_sched.loc[idx2[0], "Розклад (Чисельник / Знаменник)"] = val1
-                        
-                        st.session_state['generated_schedule'] = df_sched
-                        st.toast("✅ Уроки успішно поміняно місцями!")
-                        st.rerun()
+                for class_col in edited_pivot.columns:
+                    for slot_row in edited_pivot.index:
+                        val = edited_pivot.loc[slot_row, class_col]
+                        mask = (df_sched["День тижня"] == day_name) & (df_sched["Номер уроку"] == slot_row) & (df_sched["Клас"] == class_col)
+                        df_sched.loc[mask, "Розклад (Чисельник / Знаменник)"] = val
+        
+        st.session_state['generated_schedule'] = df_sched
 
-            # ДЕТЕКТОР КОНФЛІКТІВ ВЧИТЕЛІВ В РЕАЛЬНОМУ ЧАСІ
-            teacher_conflicts = []
-            temp_records = []
-            for _, row in df_sched.iterrows():
-                val = row["Розклад (Чисельник / Знаменник)"]
-                if val != "—":
-                    parts = val.split(" / ")
-                    for p in parts:
-                        if "(" in p and ")" in p:
-                            t_name = p.split("(")[1].split(")")[0].strip()
-                            temp_records.append({
-                                "Вчитель": t_name,
-                                "День": row["День тижня"],
-                                "Слот": row["Номер уроку"],
-                                "Клас": row["Клас"]
-                            })
+        # ЕКСПОРТ В EXCEL
+        wb = Workbook()
+        wb.remove(wb.active)
+        font_header = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+        font_body = Font(name="Arial", size=10)
+        fill_header = PatternFill(start_color="365F91", end_color="365F91", fill_type="solid")
+        thin_border = Border(left=Side(style='thin', color='B0B0B0'), right=Side(style='thin', color='B0B0B0'), top=Side(style='thin', color='B0B0B0'), bottom=Side(style='thin', color='B0B0B0'))
+
+        for class_id in sorted(df_sched["Клас"].unique()):
+            ws = wb.create_sheet(title=f"Клас {class_id}")
+            ws.sheet_view.showGridLines = True
+            headers = ["День тижня", "Номер уроку", "Розклад (Чисельник / Знаменник)"]
+            ws.append(headers)
             
-            if temp_records:
-                check_df = pd.DataFrame(temp_records)
-                duplicates = check_df[check_df.duplicated(subset=["Вчитель", "День", "Слот"], keep=False)]
-                if not duplicates.empty:
-                    for (t_name, d, s), group in duplicates.groupby(["Вчитель", "День", "Слот"]):
-                        classes_str = ", ".join(group["Клас"].unique())
-                        teacher_conflicts.append(f"⚠️ **{t_name}** має накладку в **{d}**, **{s}-й урок** у класах: {classes_str}")
+            for col_num, header in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col_num)
+                cell.font = font_header; cell.fill = fill_header; cell.border = thin_border
+                cell.alignment = Alignment(horizontal="center", vertical="center")
 
-            if teacher_conflicts:
-                st.warning("Виявлено конфлікти після ручного редагування:")
-                for conf in teacher_conflicts:
-                    st.write(conf)
+            class_data = df_sched[df_sched["Клас"] == class_id]
+            for _, row_data in class_data.iterrows():
+                ws.append([row_data["День тижня"], f"Урок №{row_data['Номер уроку']}", row_data["Розклад (Чисельник / Знаменник)"]])
+                curr_row = ws.max_row
+                for col_num in range(1, 4):
+                    c = ws.cell(row=curr_row, column=col_num)
+                    c.font = font_body; c.border = thin_border
+                    c.alignment = Alignment(horizontal="center" if col_num <= 2 else "left", vertical="center")
 
-            # ВІДОБРАЖЕННЯ РОЗКЛАДУ ПО ДНЯХ Х КЛАСАХ (МАТРИЦЯ)
-            st.subheader("📅 Розклад за днями тижня (Вся школа):")
-            
-            day_tabs = st.tabs([f"🗓️ {day}" for day in DAYS])
-            
-            for idx, day_name in enumerate(DAYS):
-                with day_tabs[idx]:
-                    df_day = df_sched[df_sched["День тижня"] == day_name]
-                    
-                    pivot_day = df_day.pivot(
-                        index="Номер уроку", 
-                        columns="Клас", 
-                        values="Розклад (Чисельник / Знаменник)"
-                    )
-                    
-                    st.caption("💡 Натисніть двічі на будь-яку комірку, щоб змінити предмет чи вчителя на цей день:")
-                    
-                    edited_pivot = st.data_editor(
-                        pivot_day,
-                        use_container_width=True,
-                        key=f"editor_day_{day_name}"
-                    )
-                    
-                    for class_col in edited_pivot.columns:
-                        for slot_row in edited_pivot.index:
-                            val = edited_pivot.loc[slot_row, class_col]
-                            mask = (df_sched["День тижня"] == day_name) & (df_sched["Номер уроку"] == slot_row) & (df_sched["Клас"] == class_col)
-                            df_sched.loc[mask, "Розклад (Чисельник / Знаменник)"] = val
-            
-            st.session_state['generated_schedule'] = df_sched
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or '')) for cell in col)
+                col_letter = get_column_letter(col[0].column)
+                ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
 
-            # ГЕНЕРАЦІЯ ОФОРМЛЕНОГО EXCEL З УРАХУВАННЯМ ПРАВОК
-            wb = Workbook()
-            wb.remove(wb.active)
-            font_header = Font(name="Arial", size=11, bold=True, color="FFFFFF")
-            font_body = Font(name="Arial", size=10)
-            fill_header = PatternFill(start_color="365F91", end_color="365F91", fill_type="solid")
-            thin_border = Border(
-                left=Side(style='thin', color='B0B0B0'), right=Side(style='thin', color='B0B0B0'),
-                top=Side(style='thin', color='B0B0B0'), bottom=Side(style='thin', color='B0B0B0')
-            )
+        excel_buffer = io.BytesIO()
+        wb.save(excel_buffer)
+        excel_buffer.seek(0)
 
-            for class_id in sorted(df_sched["Клас"].unique()):
-                ws = wb.create_sheet(title=f"Клас {class_id}")
-                ws.sheet_view.showGridLines = True
-                headers = ["День тижня", "Номер уроку", "Розклад (Чисельник / Знаменник)"]
-                ws.append(headers)
-                
-                for col_num, header in enumerate(headers, 1):
-                    cell = ws.cell(row=1, column=col_num)
-                    cell.font = font_header; cell.fill = fill_header; cell.border = thin_border
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
+        st.markdown("---")
+        st.download_button(
+            label="📥 СКАЧАТИ ВІДКОРИГОВАНИЙ РОЗКЛАД В EXCEL (.xlsx)", 
+            data=excel_buffer, 
+            file_name="school_schedule_edited.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
+            use_container_width=True
+        )
 
-                class_data = df_sched[df_sched["Клас"] == class_id]
-                for _, row_data in class_data.iterrows():
-                    ws.append([row_data["День тижня"], f"Урок №{row_data['Номер уроку']}", row_data["Розклад (Чисельник / Знаменник)"]])
-                    curr_row = ws.max_row
-                    for col_num in range(1, 4):
-                        c = ws.cell(row=curr_row, column=col_num)
-                        c.font = font_body; c.border = thin_border
-                        c.alignment = Alignment(horizontal="center" if col_num <= 2 else "left", vertical="center")
-
-                for col in ws.columns:
-                    max_len = max(len(str(cell.value or '')) for cell in col)
-                    col_letter = get_column_letter(col[0].column)
-                    ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
-                ws.row_dimensions.height = 25
-
-            excel_buffer = io.BytesIO()
-            wb.save(excel_buffer)
-            excel_buffer.seek(0)
-
-            st.markdown("---")
-            st.download_button(
-                label="📥 СКАЧАТИ ВІДКОРИГОВАНИЙ РОЗКЛАД В EXCEL (.xlsx)", 
-                data=excel_buffer, 
-                file_name="school_schedule_edited.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
-                use_container_width=True
-            )
+# --- ВКЛАДКА 4: ДОВІДНИК САНІТАРНОГО РЕГЛАМЕНТУ ---
+with tab4:
+    st.subheader("📜 Вимоги Санітарного регламенту для ЗЗСО")
+    col_r1, col_r2 = st.columns(2)
+    with col_r1:
+        st.markdown("""
+        **1. Тривалість занять:**
+        * **1 клас:** 35 хвилин
+        * **2–4 класи:** 40 хвилин
+        * **5–12 класи:** 45 хвилин
+        
+        **2. Тривалість перерв:**
+        * Мала перерва: не менше **10 хвилин**.
+        * Велика перерва (харчування/відпочинок): **20–30 хвилин** (або дві по 20 хвилин).
+        """)
+    with col_r2:
+        st.markdown("""
+        **3. Робота з екранами (ТЗН) під час онлайн-уроку:**
+        * **1 класи:** не більше 10 хвилин
+        * **2–4 класи:** не більше 15 хвилин
+        * **5–7 класи:** не більше 20 хвилин
+        * **8–9 класи:** 20–25 хвилин
+        * **10–12 класи:** 25–30 хвилин (на 1-й години), 15–20 хвилин (на 2-й години).
+        """)
